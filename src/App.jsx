@@ -97,13 +97,27 @@ function simulate(p, light = false) {
 
   let mode = "PUT";
   let K = 0, notl = 0;
+  let extras = []; // cash-settled overlay options for the current quarter
   let entry = null;
-  let pvTotal = 0; // signed: + puts held, − calls written
+  let pvTotal = 0; // value of the free option received each quarter (held long)
   let anchorS = S;
   let rollIdx = 0;
 
+  // combined hedge target of the overlay legs: long puts hold N(-d1) x notional,
+  // long calls short N(d1) x notional
+  const extrasTarget = (T) =>
+    extras.reduce((a, e) => a + (e.kind === "PUT" ? e.notl * hedgeFrac(S, e.K, T, p.iv) : -e.notl * (1 - hedgeFrac(S, e.K, T, p.iv))), 0);
+
   const startQuarter = (idx) => {
     const cfg = p.rollCfg[idx];
+    extras = (cfg.extras || [])
+      .filter((e) => e.K > 0 && e.size > 0)
+      .map((e) => {
+        const n = e.size / e.K;
+        const pv = (e.kind === "PUT" ? putPV(S, e.K, Texp, p.iv, p.rfr) : callPV(S, e.K, Texp, p.iv, p.rfr)) * n;
+        pvTotal += pv;
+        return { kind: e.kind, K: e.K, notl: n, pv, payoff: 0 };
+      });
     if (mode === "PUT") {
       // entry-spot teleport only allowed when the book is flat (no phantom P&L)
       if (cfg.spotMode === "manual" && cfg.spotVal > 0 && Math.abs(inv) < 1e-9) S = cfg.spotVal;
@@ -116,20 +130,33 @@ function simulate(p, light = false) {
       const pv = putPV(S, K, Texp, p.iv, p.rfr) * notl;
       pvTotal += pv;
       entry = { type: "PUT", K, notl, spotEntry: S, pv };
-      trade(notl * hedgeFrac(S, K, Texp, p.iv));
     } else {
       // Long CALL at the ITM put's strike (unless overridden). By parity,
       // inherited tokens + free option at K == long call at K + cash K:
       // the book is long the option, so its PV is positive, and the combined
       // delta target is notl * N(-d1) — the same formula as the put phase,
       // just with the strike carried instead of re-struck.
-      if (cfg.strikeMode === "manual" && cfg.strikeVal > 0) K = cfg.strikeVal;
-      notl = inv;
-      const pv = callPV(S, K, Texp, p.iv, p.rfr) * notl;
-      pvTotal += pv;
-      entry = { type: "CALL", K, notl, spotEntry: S, pv };
-      trade(notl * hedgeFrac(S, K, Texp, p.iv));
+      if (cfg.callAsPut) {
+        // Take the quarter's free option as a FRESH PUT below the carried
+        // strike instead of the parity call at K: less option PV, but the
+        // grid keeps scalping the inventory around the new strike, and the
+        // strike in force (delivery right) steps down with it.
+        let autoK = S * (1 + p.offset);
+        if (p.capOn && p.capPct > 0) autoK = Math.min(autoK, p.spot * p.capPct);
+        K = cfg.strikeMode === "manual" && cfg.strikeVal > 0 ? cfg.strikeVal : autoK;
+        notl = inv;
+        const pv = putPV(S, K, Texp, p.iv, p.rfr) * notl;
+        pvTotal += pv;
+        entry = { type: "HOLD+PUT", K, notl, spotEntry: S, pv };
+      } else {
+        if (cfg.strikeMode === "manual" && cfg.strikeVal > 0) K = cfg.strikeVal;
+        notl = inv;
+        const pv = callPV(S, K, Texp, p.iv, p.rfr) * notl;
+        pvTotal += pv;
+        entry = { type: "CALL", K, notl, spotEntry: S, pv };
+      }
     }
+    trade(notl * hedgeFrac(S, K, Texp, p.iv) + extrasTarget(Texp));
     anchorS = S;
   };
 
@@ -147,6 +174,14 @@ function simulate(p, light = false) {
     const isExpiry = el === RL;
 
     if (isExpiry) {
+      // overlay legs settle in cash at the quarter's end; the pin trade below
+      // flattens their hedge because targets are absolute
+      for (const e of extras) {
+        e.payoff = (e.kind === "PUT" ? Math.max(0, e.K - S) : Math.max(0, S - e.K)) * e.notl;
+        cash += e.payoff;
+      }
+      const exSettled = extras;
+      extras = [];
       if (mode === "PUT") {
         const itm = S < K;
         trade(itm ? notl : 0); // pin: |delta| -> 1 ITM, 0 OTM
@@ -162,7 +197,7 @@ function simulate(p, light = false) {
         } else {
           outcome = "OTM · expired";
         }
-        if (!light) rolls.push({ ...entry, exit: S, itm, payoff, outcome, token: inv, usdt: cash });
+        if (!light) rolls.push({ ...entry, extras: exSettled, exit: S, itm, payoff, outcome, token: inv, usdt: cash });
         if (i < N) {
           mode = itm && p.itmToCall ? "CALL" : "PUT";
           rollIdx += 1;
@@ -174,7 +209,7 @@ function simulate(p, light = false) {
         const exited = S >= K;
         trade(exited ? 0 : notl);
         const outcome = exited ? "exited ≥ K" : "holding";
-        if (!light) rolls.push({ ...entry, exit: S, itm: exited, payoff: 0, outcome, token: inv, usdt: cash });
+        if (!light) rolls.push({ ...entry, extras: exSettled, exit: S, itm: exited, payoff: 0, outcome, token: inv, usdt: cash });
         if (i < N) {
           mode = exited ? "PUT" : "CALL";
           rollIdx += 1;
@@ -183,7 +218,7 @@ function simulate(p, light = false) {
       }
     } else if (Math.abs(S / anchorS - 1) >= p.dist) {
       const T = (RL - el) / (365 * spd);
-      trade(notl * hedgeFrac(S, K, T, p.iv));
+      trade(notl * hedgeFrac(S, K, T, p.iv) + extrasTarget(T));
       anchorS = S;
     }
 
@@ -272,6 +307,7 @@ function bigMonteCarlo(p, nSims) {
   const tokAll = statsOf(out.map((x) => x.tokDel)); // unconditional, includes the 0s
   const tokDel = inKind.length ? statsOf(inKind.map((x) => x.tokDel)) : null;
   const kindMkt = inKind.length ? statsOf(inKind.map((x) => x.clientValue - x.usdtRepaid)) : null;
+  const kindUsdt = inKind.length ? statsOf(inKind.map((x) => x.usdtRepaid)) : null;
   const pctFullUsdt = out.filter((x) => x.usdtRepaid >= p.facility - 1).length / out.length;
   const pctFullKind = out.filter((x) => x.usdtRepaid <= 1).length / out.length;
   const pctPartial = Math.max(0, 1 - pctFullUsdt - pctFullKind);
@@ -294,7 +330,7 @@ function bigMonteCarlo(p, nSims) {
   const minKindPath = inKind.length ? inKind.reduce((a, x) => (x.tokDel < a.tokDel ? x : a), inKind[0]) : null;
   const anyFlat = out.some((x) => x.tokDel <= 1);
 
-  return { n: out.length, pnl, usdtRepaid, clientValue, tokAll, tokDel, kindMkt, pctInKind, pctFullUsdt, pctFullKind, pctPartial, pctLoss, pctNegCash, meanFees, meanPV, bins, maxTokPath, minKindPath, anyFlat };
+  return { n: out.length, pnl, usdtRepaid, clientValue, tokAll, tokDel, kindMkt, kindUsdt, pctInKind, pctFullUsdt, pctFullKind, pctPartial, pctLoss, pctNegCash, meanFees, meanPV, bins, maxTokPath, minKindPath, anyFlat };
 }
 
 /* ================= format ================= */
@@ -386,20 +422,24 @@ export default function App() {
   const [seed, setSeed] = useState(42);
 
   const [rollCfg, setRollCfg] = useState([
-    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05 },
-    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05 },
-    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05 },
-    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05 },
+    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05, callAsPut: false, extras: [] },
+    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05, callAsPut: false, extras: [] },
+    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05, callAsPut: false, extras: [] },
+    { spotMode: "auto", spotVal: 0.05, strikeMode: "auto", strikeVal: 0.05, callAsPut: false, extras: [] },
   ]);
   const setRoll = (i, patch) =>
     setRollCfg((c) => c.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const setExtra = (q, j, patch) => setRoll(q, { extras: (rollCfg[q].extras || []).map((e, k) => (k === j ? { ...e, ...patch } : e)) });
+  const addExtra = (q, def) => setRoll(q, { extras: [...(rollCfg[q].extras || []), def] });
+  const rmExtra = (q, j) => setRoll(q, { extras: (rollCfg[q].extras || []).filter((_, k) => k !== j) });
 
   const params = { facility, spot, offset, iv, rv, mu, rfr, dist, costBps, compound, itmToCall, capOn, capPct, seed, rollCfg };
 
   const res = useMemo(() => simulate(params), [facility, spot, offset, iv, rv, mu, rfr, dist, costBps, compound, itmToCall, capOn, capPct, seed, rollCfg]);
   const mc = useMemo(() => monteCarlo(params), [facility, spot, offset, iv, rv, mu, rfr, dist, costBps, compound, itmToCall, capOn, capPct, seed, rollCfg]);
 
-  const pnlPct = (res.settlePnl / facility) * 100;
+  const totalFace = facility;
+  const pnlPct = (res.settlePnl / totalFace) * 100;
 
   // pages + heavy Monte Carlo
   const [page, setPage] = useState("dash");
@@ -438,7 +478,7 @@ export default function App() {
         @media (prefers-reduced-motion: reduce){ *{ transition:none!important; } }
       `}</style>
 
-      <div style={{ maxWidth: 1180, margin: "0 auto" }}>
+      <div style={{ maxWidth: 1440, margin: "0 auto" }}>
         <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", gap: 12, marginBottom: 4 }}>
           <h1 style={{ fontSize: 21, fontWeight: 700, margin: 0, letterSpacing: -0.3 }}>Long put, delta-hedged · grid bot</h1>
           <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: C.blue, border: `1px solid ${C.blue}`, borderRadius: 4, padding: "2px 7px" }}>
@@ -446,7 +486,7 @@ export default function App() {
           </span>
         </div>
         <p style={{ color: C.sub, fontSize: 12.5, margin: "0 0 18px", maxWidth: 760, lineHeight: 1.5 }}>
-          The client lends the desk {fmtM(facility)} USDT. Each quarter the desk holds a free 90-day option
+          The client lends the desk {fmtM(totalFace)} USDT. Each quarter the desk holds a free 90-day option
           and grid-hedges its delta in spot. Puts: buy as price falls, sell as it rises. An ITM put leaves the
           book holding the full notional; the next quarter is a long call at that put's strike, hedged with the
           same grid (target N(−d1) × notional), selling the inventory as price climbs back through K.
@@ -490,8 +530,8 @@ export default function App() {
             <Metric
               label="Client receives (market)"
               value={fmtUSD(res.clientValue)}
-              sub={res.clientValue < facility ? `shortfall ${fmtUSD(facility - res.clientValue)} vs loan` : "full value"}
-              color={res.clientValue < facility ? C.warn : C.usdt}
+              sub={res.clientValue < totalFace ? `shortfall ${fmtUSD(totalFace - res.clientValue)} vs loan` : "full value"}
+              color={res.clientValue < totalFace ? C.warn : C.usdt}
             />
             <Metric
               label="Desk keeps"
@@ -511,7 +551,7 @@ export default function App() {
           {/* params */}
           <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
             <PanelTitle>Parameters</PanelTitle>
-            <Slider label="Loan size (USDT)" value={facility} min={500000} max={20000000} step={250000} onChange={setFacility} fmt={(v) => fmtM(v) + " $"} />
+            <Slider label="Program size (USDT)" value={facility} min={500000} max={20000000} step={250000} onChange={setFacility} fmt={(v) => fmtM(v) + " $"} />
             <Slider label="Starting spot" value={spot} min={0.01} max={0.2} step={0.001} onChange={setSpot} fmt={fmtPx} />
             <Slider label="Strike offset (puts)" value={offset} min={-0.3} max={0.1} step={0.01} onChange={setOffset} fmt={(v) => fmtNum(v * 100, 0) + " %"} />
             <Slider label="Implied vol (delta + PV)" value={iv} min={0.3} max={1.5} step={0.05} onChange={setIv} fmt={(v) => fmtNum(v * 100, 0) + " %"} />
@@ -581,10 +621,10 @@ export default function App() {
           <div style={{ display: "flex", flexDirection: "column", gap: 16, minWidth: 0 }}>
 
             {/* per-quarter overrides */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: 10 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 10 }}>
               {rollCfg.map((cfg, i) => {
                 const r = res.rolls[i];
-                const isCall = r?.type === "CALL";
+                const isCall = r?.type === "CALL" || r?.type === "HOLD+PUT";
                 const OvRow = ({ label, mode, val, onMode, onVal, autoText, disabled }) => (
                   <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 5, opacity: disabled ? 0.45 : 1 }}>
                     <span style={{ fontSize: 10.5, color: C.sub, width: 38 }}>{label}</span>
@@ -632,11 +672,70 @@ export default function App() {
                       label="strike" mode={cfg.strikeMode} val={cfg.strikeVal}
                       onMode={() => setRoll(i, { strikeMode: cfg.strikeMode === "auto" ? "manual" : "auto", strikeVal: r ? r.K : spot })}
                       onVal={(v) => setRoll(i, { strikeVal: v })}
-                      autoText={r ? (isCall ? `${fmtPx(r.K)} (put K)` : `${fmtPx(r.K)} (${fmtNum(offset * 100, 0)}%)`) : "spot×(1+off)"}
+                      autoText={r ? (isCall ? `${fmtPx(r.K)} (${cfg.callAsPut ? "fresh put" : "put K"})` : `${fmtPx(r.K)} (${fmtNum(offset * 100, 0)}%)`) : "spot×(1+off)"}
                     />
+                    {isCall && (
+                      <div style={{ display: "flex", gap: 5, alignItems: "center", marginBottom: 5 }}>
+                        <span style={{ fontSize: 10.5, color: C.sub, width: 38 }}>option</span>
+                        <button
+                          onClick={() => setRoll(i, { callAsPut: !cfg.callAsPut })}
+                          style={{
+                            fontSize: 10, padding: "2px 6px", borderRadius: 4, cursor: "pointer",
+                            border: `1px solid ${cfg.callAsPut ? C.blue : C.line}`,
+                            background: cfg.callAsPut ? C.blue : "transparent",
+                            color: cfg.callAsPut ? "#0D1220" : C.sub,
+                            fontFamily: "'IBM Plex Mono', monospace",
+                          }}
+                        >
+                          {cfg.callAsPut ? "fresh put @ lower K" : "call @ put K"}
+                        </button>
+                      </div>
+                    )}
+                    {(cfg.extras || []).map((e, j) => (
+                      <div key={j} style={{ display: "flex", gap: 4, alignItems: "center", marginBottom: 4 }}>
+                        <button
+                          onClick={() => setExtra(i, j, { kind: e.kind === "PUT" ? "CALL" : "PUT" })}
+                          style={{ fontSize: 10, padding: "2px 5px", borderRadius: 4, cursor: "pointer", border: "none", background: e.kind === "PUT" ? C.blue : C.token, color: "#0D1220", fontWeight: 700 }}
+                        >
+                          {e.kind}
+                        </button>
+                        <input
+                          type="number" step="0.001" value={e.K}
+                          onChange={(ev) => setExtra(i, j, { K: parseFloat(ev.target.value) || 0 })}
+                          style={{ width: 60, fontSize: 11, padding: "2px 4px", border: `1px solid ${C.line}`, borderRadius: 4, background: C.panel2, color: C.ink }}
+                          aria-label={`extra option strike Q${i + 1}`}
+                        />
+                        <input
+                          type="number" step="100000" value={e.size}
+                          onChange={(ev) => setExtra(i, j, { size: parseFloat(ev.target.value) || 0 })}
+                          style={{ width: 74, fontSize: 11, padding: "2px 4px", border: `1px solid ${C.line}`, borderRadius: 4, background: C.panel2, color: C.ink }}
+                          aria-label={`extra option size Q${i + 1}`}
+                        />
+                        <span style={{ fontSize: 10, color: C.sub }}>$</span>
+                        <button
+                          onClick={() => rmExtra(i, j)}
+                          title="Delete this option"
+                          style={{ display: "flex", alignItems: "center", padding: "3px 4px", border: `1px solid ${C.line}`, borderRadius: 4, background: "transparent", color: C.neg, cursor: "pointer" }}
+                          aria-label={`delete extra option ${j + 1} Q${i + 1}`}
+                        >
+                          <svg width="11" height="12" viewBox="0 0 11 12" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
+                            <path d="M1 2.8h9M4 2.8V1.6h3v1.2M2 2.8l.6 8h5.8l.6-8M4.2 5v3.8M6.8 5v3.8" />
+                          </svg>
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => addExtra(i, { kind: "PUT", K: Number(((r ? r.K : spot) * 0.9).toFixed(5)), size: 2000000 })}
+                      style={{ fontSize: 10, padding: "2px 8px", marginBottom: 5, borderRadius: 4, cursor: "pointer", border: `1px dashed ${C.line}`, background: "transparent", color: C.sub }}
+                    >
+                      + add option
+                    </button>
                     {r && (
                       <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, lineHeight: 1.7, marginTop: 4 }}>
                         <div><span style={{ color: C.sub }}>PV</span> <span style={{ color: r.pv >= 0 ? C.blue : C.neg }}>{fmtM(r.pv)} $</span> · <span style={{ color: C.sub }}>exit</span> {fmtPx(r.exit)}</div>
+                        {r.extras && r.extras.map((e, j) => (
+                          <div key={j}><span style={{ color: C.sub }}>+{e.kind}</span> @{fmtPx(e.K)} · <span style={{ color: C.sub }}>PV</span> <span style={{ color: C.blue }}>{fmtM(e.pv)} $</span> · <span style={{ color: C.sub }}>paid</span> <span style={{ color: e.payoff > 0 ? C.pos : C.sub }}>{fmtM(e.payoff)} $</span></div>
+                        ))}
                         <div><span style={{ color: C.sub }}>USDT after</span> <span style={{ color: C.usdt }}>{fmtM(r.usdt)} $</span>{r.token > 1 && <> · <span style={{ color: C.sub }}>TOKEN</span> <span style={{ color: C.token }}>{fmtM(r.token)} = {fmtM(r.token * r.exit)} $</span></>}</div>
                       </div>
                     )}
@@ -648,7 +747,9 @@ export default function App() {
               Quarter types are path-dependent: an ITM put makes the next quarter a long call at the put's strike;
               once the inventory is sold out above K, quarters flip back to puts. Manual entry spot restarts the path
               at the boundary (only when the book is flat — disabled on call quarters). Manual strike overrides the
-              default (puts: spot × (1 + offset); calls: previous put's K).
+              default (puts: spot × (1 + offset); calls: previous put's K). On call quarters, “fresh put” takes the
+              quarter's free option as a new put at spot × (1 + offset) against the held inventory instead of the
+              parity call — less PV, same grid scalping, and the delivery strike steps down with it. “+ add option” attaches extra cash-settled options to a quarter (pick type, strike and $ size): they are grid-hedged alongside the book — puts hold N(−d1) × notional, calls short it — pay their intrinsic value at the quarter's expiry, and count in the PV of options. They do not change the loan face or settlement.
             </p>
 
             {/* chart 1 */}
@@ -684,7 +785,7 @@ export default function App() {
                   />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
                   <ReferenceLine y={0} stroke={C.neg} strokeDasharray="3 3" />
-                  <ReferenceLine y={facility} stroke={C.sub} strokeDasharray="3 3" />
+                  <ReferenceLine y={totalFace} stroke={C.sub} strokeDasharray="3 3" />
                   {[90, 180, 270].map((d) => <ReferenceLine key={d} x={d} stroke={C.line} />)}
                   <Line dataKey="cash" stroke={C.usdt} dot={false} strokeWidth={1.5} name="cash" isAnimationActive={false} />
                   <Line dataKey="invVal" stroke={C.token} dot={false} strokeWidth={1.5} name="invVal" isAnimationActive={false} />
@@ -840,11 +941,11 @@ export default function App() {
               <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: "14px 14px 10px", overflowX: "auto" }}>
                 <PanelTitle>What goes back to the client</PanelTitle>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, marginBottom: 12 }}>
-                  <Metric label="Face repaid" value={fmtM(facility) + " $"} sub="always — the split is all-or-nothing" color={C.ink} />
-                  <Metric label="6M all in USDT" value={fmtNum(big.result.pctFullUsdt * 100, 1) + " %"} sub="of paths — year ends flat" color={C.usdt} />
+                  <Metric label="Face repaid" value={fmtM(totalFace) + " $"} sub="always — in USDT, TOKEN at K, or both" color={C.ink} />
+                  <Metric label={`${fmtM(totalFace)} $ all in USDT`} value={fmtNum(big.result.pctFullUsdt * 100, 1) + " %"} sub="of paths — year ends flat" color={C.usdt} />
                   <Metric label="All in TOKEN (face @ K)" value={fmtNum(big.result.pctFullKind * 100, 1) + " %"} sub="of paths — full tranche in-kind" color={C.token} />
                   {big.result.pctPartial > 0.001 && (
-                    <Metric label="Mixed split" value={fmtNum(big.result.pctPartial * 100, 1) + " %"} sub="of paths (compounding only)" />
+                    <Metric label="Mixed split" value={fmtNum(big.result.pctPartial * 100, 1) + " %"} sub="of paths — compounding or fresh-put re-strike" />
                   )}
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 10, marginBottom: 12 }}>
@@ -852,7 +953,7 @@ export default function App() {
                     <Metric
                       label="Least TOKEN sent (best case if you want USDT back)"
                       value="0 TOKEN"
-                      sub={`package: ${fmtM(facility)} $ USDT · ${fmtNum(big.result.pctFullUsdt * 100, 0)} % of paths end here`}
+                      sub={`package: ${fmtM(totalFace)} $ USDT · ${fmtNum(big.result.pctFullUsdt * 100, 0)} % of paths end here`}
                       color={C.usdt}
                     />
                   )}
@@ -860,7 +961,7 @@ export default function App() {
                     <Metric
                       label="Guaranteed minimum when in-kind"
                       value={fmtM(big.result.minKindPath.tokDel) + " TOKEN"}
-                      sub={`package: 0 USDT + tokens @ K ${fmtPx(big.result.minKindPath.Kend)} · mkt ${fmtM(big.result.minKindPath.clientValue)} $`}
+                      sub={`package: ${fmtM(big.result.minKindPath.usdtRepaid)} $ USDT + tokens @ K ${fmtPx(big.result.minKindPath.Kend)} · mkt ${fmtM(big.result.minKindPath.clientValue)} $ at S ${fmtPx(big.result.minKindPath.Sfinal)}`}
                       color={C.token}
                     />
                   )}
@@ -868,7 +969,7 @@ export default function App() {
                     <Metric
                       label="Most TOKEN sent (deepest strike path)"
                       value={fmtM(big.result.maxTokPath.tokDel) + " TOKEN"}
-                      sub={`package: 0 USDT + tokens @ K ${fmtPx(big.result.maxTokPath.Kend)} · mkt ${fmtM(big.result.maxTokPath.clientValue)} $ at S ${fmtPx(big.result.maxTokPath.Sfinal)}`}
+                      sub={`package: ${fmtM(big.result.maxTokPath.usdtRepaid)} $ USDT + tokens @ K ${fmtPx(big.result.maxTokPath.Kend)} · mkt ${fmtM(big.result.maxTokPath.clientValue)} $ at S ${fmtPx(big.result.maxTokPath.Sfinal)}`}
                       color={C.token}
                     />
                   )}
@@ -887,15 +988,17 @@ export default function App() {
                     <tr style={{ borderTop: `1px solid ${C.line}`, textAlign: "right" }}>
                       <td style={{ textAlign: "left", padding: "7px 8px 7px 0", color: C.usdt }}>Year ends flat — repaid in USDT</td>
                       <td style={{ padding: "7px 8px" }}>{fmtNum(big.result.pctFullUsdt * 100, 1)} %</td>
-                      <td style={{ padding: "7px 8px", color: C.usdt }}>{fmtM(facility)} $</td>
+                      <td style={{ padding: "7px 8px", color: C.usdt }}>{fmtM(totalFace)} $</td>
                       <td style={{ padding: "7px 8px", color: C.sub }}>0</td>
-                      <td style={{ padding: "7px 0 7px 8px" }}>{fmtM(facility)} $ (full)</td>
+                      <td style={{ padding: "7px 0 7px 8px" }}>{fmtM(totalFace)} $ (full)</td>
                     </tr>
                     {big.result.tokDel && (
                       <tr style={{ borderTop: `1px solid ${C.line}`, textAlign: "right" }}>
-                        <td style={{ textAlign: "left", padding: "7px 8px 7px 0", color: C.token }}>Repaid in kind — tokens at strike</td>
-                        <td style={{ padding: "7px 8px" }}>{fmtNum(big.result.pctFullKind * 100, 1)} %</td>
-                        <td style={{ padding: "7px 8px", color: C.sub }}>0</td>
+                        <td style={{ textAlign: "left", padding: "7px 8px 7px 0", color: C.token }}>Tokens delivered at strike (any in-kind)</td>
+                        <td style={{ padding: "7px 8px" }}>{fmtNum(big.result.pctInKind * 100, 1)} %</td>
+                        <td style={{ padding: "7px 8px", color: C.sub }}>
+                          {big.result.kindUsdt.max <= 1 ? "0" : `0 – ${fmtM(big.result.kindUsdt.max)} $`}
+                        </td>
                         <td style={{ padding: "7px 8px", color: C.token }}>
                           {Math.abs(big.result.tokDel.max - big.result.tokDel.min) < 1
                             ? `${fmtM(big.result.tokDel.min)} (always)`
@@ -908,17 +1011,18 @@ export default function App() {
                     )}
                     {big.result.pctPartial > 0.001 && (
                       <tr style={{ borderTop: `1px solid ${C.line}`, textAlign: "right" }}>
-                        <td style={{ textAlign: "left", padding: "7px 8px 7px 0" }}>Mixed (compounding only)</td>
+                        <td style={{ textAlign: "left", padding: "7px 8px 7px 0" }}>Mixed split</td>
                         <td style={{ padding: "7px 8px" }}>{fmtNum(big.result.pctPartial * 100, 1)} %</td>
-                        <td style={{ padding: "7px 8px", color: C.sub }} colSpan={3}>USDT + TOKEN summing to {fmtM(facility)} $ at face</td>
+                        <td style={{ padding: "7px 8px", color: C.sub }} colSpan={3}>USDT + TOKEN summing to {fmtM(totalFace)} $ at face</td>
                       </tr>
                     )}
                   </tbody>
                 </table>
                 <p style={{ fontSize: 11, color: C.sub, margin: "10px 0 2px", lineHeight: 1.5 }}>
-                  With one option per quarter the tranche is all-or-nothing, so the face split is binary: the client
-                  gets {fmtM(facility)} $ entirely in USDT or entirely in TOKEN counted at the strike — the two legs are
-                  jointly constrained (0 USDT implies the token floor; full USDT implies 0 TOKEN), which is why outcomes
+                  With one option per quarter sized on the full face, the split is usually binary: the client gets{" "}
+                  {fmtM(totalFace)} $ entirely in USDT or entirely in TOKEN counted at the strike. Compounding — or a
+                  fresh-put re-strike, whose lower K makes the held inventory cover less face — produces genuine
+                  mixed splits. The two legs are jointly constrained, which is why outcomes
                   are shown as conditional rows rather than independent columns. The gap between face and market value
                   on the in-kind row is the client's side of the free put. Note: at 0 %
                   drift a GBM path has a −σ²/2 median trend (≈ −32 %/yr at 80 % vol), which is why in-kind outcomes
