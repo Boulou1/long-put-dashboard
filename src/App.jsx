@@ -105,19 +105,13 @@ function simulate(p, light = false) {
 
   // combined hedge target of the overlay legs: long puts hold N(-d1) x notional,
   // long calls short N(d1) x notional
+  // both kinds hedge to N(-d1) x notional: the put holds that much against
+  // the drawn USDT, the call keeps that much of the borrowed tokens
   const extrasTarget = (T) =>
-    extras.reduce((a, e) => a + (e.kind === "PUT" ? e.notl * hedgeFrac(S, e.K, T, p.iv) : -e.notl * (1 - hedgeFrac(S, e.K, T, p.iv))), 0);
+    extras.reduce((a, e) => a + e.notl * hedgeFrac(S, e.K, T, p.iv), 0);
 
   const startQuarter = (idx) => {
     const cfg = p.rollCfg[idx];
-    extras = (cfg.extras || [])
-      .filter((e) => e.K > 0 && e.size > 0)
-      .map((e) => {
-        const n = e.size / e.K;
-        const pv = (e.kind === "PUT" ? putPV(S, e.K, Texp, p.iv, p.rfr) : callPV(S, e.K, Texp, p.iv, p.rfr)) * n;
-        pvTotal += pv;
-        return { kind: e.kind, K: e.K, notl: n, pv, payoff: 0 };
-      });
     if (mode === "PUT") {
       // entry-spot teleport only allowed when the book is flat (no phantom P&L)
       if (cfg.spotMode === "manual" && cfg.spotVal > 0 && Math.abs(inv) < 1e-9) S = cfg.spotVal;
@@ -156,6 +150,19 @@ function simulate(p, light = false) {
         entry = { type: "CALL", K, notl, spotEntry: S, pv };
       }
     }
+    // Added options are one-quarter loan tranches: a put draws its size in
+    // USDT from the client, a call draws the equivalent tokens (size / K).
+    // Both are repaid at the quarter's expiry — in kind at the strike when
+    // the price ends below K, in USDT otherwise.
+    extras = (cfg.extras || [])
+      .filter((e) => e.K > 0 && e.size > 0)
+      .map((e) => {
+        const n = e.size / e.K;
+        const pv = (e.kind === "PUT" ? putPV(S, e.K, Texp, p.iv, p.rfr) : callPV(S, e.K, Texp, p.iv, p.rfr)) * n;
+        pvTotal += pv;
+        if (e.kind === "PUT") cash += e.size; else inv += n;
+        return { kind: e.kind, K: e.K, notl: n, size: e.size, pv, payoff: 0, outcome: "" };
+      });
     trade(notl * hedgeFrac(S, K, Texp, p.iv) + extrasTarget(Texp));
     anchorS = S;
   };
@@ -179,17 +186,30 @@ function simulate(p, light = false) {
     const isExpiry = el === RL;
 
     if (isExpiry) {
-      // overlay legs settle in cash at the quarter's end; the pin trade below
-      // flattens their hedge because targets are absolute
-      for (const e of extras) {
-        e.payoff = (e.kind === "PUT" ? Math.max(0, e.K - S) : Math.max(0, S - e.K)) * e.notl;
-        cash += e.payoff;
-      }
+      // added tranches pin with the book (below K both kinds hold the full
+      // notional), then each is repaid: in kind at the strike below K,
+      // in USDT at or above it
+      const exPin = extras.reduce((a, e) => a + (S < e.K ? e.notl : 0), 0);
+      const settleExtras = () => {
+        for (const e of extras) {
+          if (S < e.K) {
+            inv -= e.notl;
+            if (e.kind === "PUT") { e.payoff = (e.K - S) * e.notl; e.outcome = "delivered @ K"; }
+            else { e.payoff = 0; e.outcome = "tokens returned"; }
+          } else {
+            cash -= e.size;
+            if (e.kind === "PUT") { e.payoff = 0; e.outcome = "repaid in USDT"; }
+            else { e.payoff = (S - e.K) * e.notl; e.outcome = "exercised ≥ K"; }
+          }
+          if (cash < minCash) minCash = cash;
+        }
+        extras = [];
+      };
       const exSettled = extras;
-      extras = [];
       if (mode === "PUT") {
         const itm = S < K;
-        trade(itm ? notl : 0); // pin: |delta| -> 1 ITM, 0 OTM
+        trade((itm ? notl : 0) + exPin); // pin: |delta| -> 1 ITM, 0 OTM
+        settleExtras();
         let payoff = 0, outcome;
         if (itm && !p.itmToCall) {
           payoff = (K - S) * notl;
@@ -212,7 +232,8 @@ function simulate(p, light = false) {
         // call expiry: inventory has been scalped along N(-d1) all quarter,
         // so the pin is just the terminal delta — no separate assignment leg
         const exited = S >= K;
-        trade(exited ? 0 : notl);
+        trade((exited ? 0 : notl) + exPin);
+        settleExtras();
         const outcome = exited ? "exited ≥ K" : "holding";
         if (!light) rolls.push({ ...entry, extras: exSettled, exit: S, itm: exited, payoff: 0, outcome, token: inv, usdt: cash });
         if (i < N) {
@@ -740,7 +761,7 @@ export default function App() {
                       <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, lineHeight: 1.7, marginTop: 4 }}>
                         <div><span style={{ color: C.sub }}>PV</span> <span style={{ color: r.pv >= 0 ? C.blue : C.neg }}>{fmtM(r.pv)} $</span> · <span style={{ color: C.sub }}>exit</span> {fmtPx(r.exit)}</div>
                         {r.extras && r.extras.map((e, j) => (
-                          <div key={j}><span style={{ color: C.sub }}>+{e.kind}</span> @{fmtPx(e.K)} · <span style={{ color: C.sub }}>PV</span> <span style={{ color: C.blue }}>{fmtM(e.pv)} $</span> · <span style={{ color: C.sub }}>paid</span> <span style={{ color: e.payoff > 0 ? C.pos : C.sub }}>{fmtM(e.payoff)} $</span></div>
+                          <div key={j}><span style={{ color: C.sub }}>+{e.kind}</span> @{fmtPx(e.K)} · <span style={{ color: C.sub }}>PV</span> <span style={{ color: C.blue }}>{fmtM(e.pv)} $</span> · <span style={{ color: e.payoff > 0 ? C.pos : C.sub }}>{e.outcome}{e.payoff > 0 ? ` +${fmtM(e.payoff)} $` : ""}</span></div>
                         ))}
                         <div><span style={{ color: C.sub }}>USDT after</span> <span style={{ color: C.usdt }}>{fmtM(r.usdt)} $</span>{r.token > 1 && <> · <span style={{ color: C.sub }}>TOKEN</span> <span style={{ color: C.token }}>{fmtM(r.token)} = {fmtM(r.token * r.exit)} $</span></>}</div>
                       </div>
@@ -755,7 +776,7 @@ export default function App() {
               at the boundary (only when the book is flat — disabled on call quarters). Manual strike overrides the
               default (puts: spot × (1 + offset); calls: previous put's K). On call quarters, “fresh put” takes the
               quarter's free option as a new put at spot × (1 + offset) against the held inventory instead of the
-              parity call — less PV, same grid scalping, and the delivery strike steps down with it. “+ add option” attaches extra cash-settled options to a quarter (pick type, strike and $ size): they are grid-hedged alongside the book — puts hold N(−d1) × notional, calls short it — pay their intrinsic value at the quarter's expiry, and count in the PV of options. They do not change the loan face or settlement.
+              parity call — less PV, same grid scalping, and the delivery strike steps down with it. “+ add option” attaches a one-quarter loan tranche with its own option (pick type, strike and $ size): a put draws the size in USDT, a call draws the equivalent tokens (size / K) — the balances show the money arriving at the quarter's start. Both are grid-hedged at N(−d1) × notional and repaid at the quarter's expiry: in kind at the strike when the price ends below K, in USDT otherwise. Their PV counts in the options total; the year-end settlement face stays the main program, since these tranches repay quarterly.
             </p>
 
             {/* chart 1 */}
@@ -854,11 +875,11 @@ export default function App() {
                         <td style={{ padding: "4px 8px" }}>{fmtPx(r.exit)}</td>
                         <td style={{ padding: "4px 8px" }}>
                           <span style={{ fontSize: 9.5, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: e.payoff > 0 ? C.pos : C.usdt, color: "#0D1220" }}>
-                            {e.payoff > 0 ? `paid ${fmtM(e.payoff)} $` : "expired 0"}
+                            {e.outcome}{e.payoff > 0 ? ` +${fmtM(e.payoff)} $` : ""}
                           </span>
                         </td>
                         <td style={{ padding: "4px 8px", color: C.sub }}>—</td>
-                        <td style={{ padding: "4px 0 4px 8px", color: C.sub }}>cash-settled</td>
+                        <td style={{ padding: "4px 0 4px 8px", color: C.sub }}>tranche repaid</td>
                       </tr>
                     ))}
                     </Fragment>
