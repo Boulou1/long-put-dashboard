@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { Fragment, useState, useMemo } from "react";
 import {
   ComposedChart, BarChart, Bar, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, Legend, ReferenceLine,
@@ -161,7 +161,12 @@ function simulate(p, light = false) {
   };
 
   startQuarter(0);
-  if (!light) daily.push({ d: 0, S, K, cash, tok: inv, invVal: inv * S, total: cash + inv * S });
+  const extraKs = () => {
+    const o = {};
+    extras.forEach((e, j) => { o[(e.kind === "PUT" ? "xP" : "xC") + j] = e.K; });
+    return o;
+  };
+  if (!light) daily.push({ d: 0, S, K, cash, tok: inv, invVal: inv * S, total: cash + inv * S, ...extraKs() });
 
   for (let i = 1; i <= N; i++) {
     let u = 0, v = 0;
@@ -222,7 +227,7 @@ function simulate(p, light = false) {
       anchorS = S;
     }
 
-    if (!light && i % spd === 0) daily.push({ d: i / spd, S, K, cash, tok: inv, invVal: inv * S, total: cash + inv * S });
+    if (!light && i % spd === 0) daily.push({ d: i / spd, S, K, cash, tok: inv, invVal: inv * S, total: cash + inv * S, ...extraKs() });
   }
 
   const totalValue = cash + inv * S;
@@ -439,6 +444,7 @@ export default function App() {
   const mc = useMemo(() => monteCarlo(params), [facility, spot, offset, iv, rv, mu, rfr, dist, costBps, compound, itmToCall, capOn, capPct, seed, rollCfg]);
 
   const totalFace = facility;
+  const maxExtras = Math.max(0, ...rollCfg.map((c) => (c.extras || []).length));
   const pnlPct = (res.settlePnl / totalFace) * 100;
 
   // pages + heavy Monte Carlo
@@ -760,10 +766,16 @@ export default function App() {
                   <CartesianGrid stroke={C.line} strokeDasharray="2 4" vertical={false} />
                   <XAxis dataKey="d" tick={{ fontSize: 10, fill: C.sub }} tickLine={false} axisLine={{ stroke: C.line }} ticks={[0, 90, 180, 270, 360]} />
                   <YAxis tick={{ fontSize: 10, fill: C.sub }} tickLine={false} axisLine={false} domain={["auto", "auto"]} tickFormatter={(v) => v.toFixed(3)} width={48} />
-                  <Tooltip formatter={(v, n) => [fmtPx(v), n === "S" ? "Spot" : "Strike"]} labelFormatter={(d) => `Day ${d}`} contentStyle={tooltipStyle} />
+                  <Tooltip formatter={(v, n) => [fmtPx(v), n === "S" ? "Spot" : n === "K" ? "Strike" : n.startsWith("xP") ? "added put K" : "added call K"]} labelFormatter={(d) => `Day ${d}`} contentStyle={tooltipStyle} />
                   {[90, 180, 270].map((d) => <ReferenceLine key={d} x={d} stroke={C.line} />)}
                   <Line dataKey="S" stroke={C.ink} dot={false} strokeWidth={1.6} name="S" isAnimationActive={false} />
                   <Line dataKey="K" stroke={C.blue} dot={false} strokeWidth={1.4} strokeDasharray="5 4" type="stepAfter" name="K" isAnimationActive={false} />
+                  {Array.from({ length: maxExtras }, (_, j) => (
+                    <Line key={"xP" + j} dataKey={"xP" + j} stroke={C.usdt} dot={false} strokeWidth={1.1} strokeDasharray="2 3" type="stepAfter" name={"xP" + j} isAnimationActive={false} />
+                  ))}
+                  {Array.from({ length: maxExtras }, (_, j) => (
+                    <Line key={"xC" + j} dataKey={"xC" + j} stroke={C.warn} dot={false} strokeWidth={1.1} strokeDasharray="2 3" type="stepAfter" name={"xC" + j} isAnimationActive={false} />
+                  ))}
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -814,7 +826,8 @@ export default function App() {
                 </thead>
                 <tbody>
                   {res.rolls.map((r, i) => (
-                    <tr key={i} style={{ borderTop: `1px solid ${C.line}`, textAlign: "right" }}>
+                    <Fragment key={i}>
+                    <tr style={{ borderTop: `1px solid ${C.line}`, textAlign: "right" }}>
                       <td style={{ textAlign: "left", padding: "7px 8px 7px 0", fontWeight: 600 }}>{i + 1}</td>
                       <td style={{ padding: "7px 8px", color: r.type === "PUT" ? C.blue : C.token, fontWeight: 600 }}>{r.type}</td>
                       <td style={{ padding: "7px 8px" }}>{fmtPx(r.spotEntry)}</td>
@@ -830,6 +843,25 @@ export default function App() {
                       <td style={{ padding: "7px 8px", color: C.token }}>{r.token > 1 ? <>{fmtM(r.token)} <span style={{ color: C.sub }}>= {fmtM(r.token * r.exit)} $</span></> : "—"}</td>
                       <td style={{ padding: "7px 0 7px 8px", color: C.usdt }}>{fmtUSD(r.usdt)}</td>
                     </tr>
+                    {(r.extras || []).map((e, j) => (
+                      <tr key={"x" + j} style={{ textAlign: "right", opacity: 0.85 }}>
+                        <td style={{ textAlign: "left", padding: "4px 8px 4px 0", color: C.sub }}>{i + 1}·opt</td>
+                        <td style={{ padding: "4px 8px", color: e.kind === "PUT" ? C.usdt : C.warn, fontWeight: 600 }}>+{e.kind}</td>
+                        <td style={{ padding: "4px 8px" }}>{fmtPx(r.spotEntry)}</td>
+                        <td style={{ padding: "4px 8px" }}>{fmtPx(e.K)}</td>
+                        <td style={{ padding: "4px 8px" }}>{fmtM(e.notl)} <span style={{ color: C.sub }}>= {fmtM(e.notl * e.K)} $ @K</span></td>
+                        <td style={{ padding: "4px 8px", color: C.blue }}>{fmtUSD(e.pv)}</td>
+                        <td style={{ padding: "4px 8px" }}>{fmtPx(r.exit)}</td>
+                        <td style={{ padding: "4px 8px" }}>
+                          <span style={{ fontSize: 9.5, fontWeight: 700, padding: "1px 5px", borderRadius: 3, background: e.payoff > 0 ? C.pos : C.usdt, color: "#0D1220" }}>
+                            {e.payoff > 0 ? `paid ${fmtM(e.payoff)} $` : "expired 0"}
+                          </span>
+                        </td>
+                        <td style={{ padding: "4px 8px", color: C.sub }}>—</td>
+                        <td style={{ padding: "4px 0 4px 8px", color: C.sub }}>cash-settled</td>
+                      </tr>
+                    ))}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
